@@ -393,7 +393,7 @@ def write_release_files(
 ) -> dict[str, str]:
     unclone_hash = sha256(unclone_apk)
     clone_hash = sha256(clone_apk)
-    title = f"DCInside {app_info['version_name']} ({patches_release['tag_name']})"
+    title = f"{app_info['version_name']} ({patches_release['tag_name']})"
     signer = SIGNER_NAME if keystore_source != "morphe-default" else "Morphe"
     alias = KEYSTORE_ALIAS if keystore_source != "morphe-default" else "Morphe"
     notes = "\n".join(
