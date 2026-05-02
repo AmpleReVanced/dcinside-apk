@@ -129,6 +129,11 @@ def read_url(url: str, *, accept: str | None = None, use_token: bool = False) ->
         try:
             with urllib.request.urlopen(request(url, accept=accept, use_token=use_token)) as response:
                 return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise
+            last_error = exc
+            time.sleep(2**attempt)
         except urllib.error.URLError as exc:
             last_error = exc
             time.sleep(2**attempt)
