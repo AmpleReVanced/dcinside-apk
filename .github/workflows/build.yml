@@ -1,0 +1,111 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      patches_tag:
+        required: true
+        type: string
+      force:
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      patches_tag:
+        description: "Specific AmpleReVanced/revanced-patches tag. Empty means latest release, including prereleases."
+        required: false
+        type: string
+      force:
+        description: "Build even if this repository already has a release for the patches tag."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: dcinside-build-${{ inputs.patches_tag || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - name: Check release target
+        id: check
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PATCHES_TAG: ${{ inputs.patches_tag }}
+          FORCE_BUILD: ${{ inputs.force }}
+        run: |
+          args=()
+          if [ -n "${PATCHES_TAG}" ]; then
+            args+=(--patches-tag "${PATCHES_TAG}")
+          fi
+          if [ "${FORCE_BUILD}" = "true" ]; then
+            args+=(--force)
+          fi
+          python3 scripts/build_dcinside.py check "${args[@]}"
+
+      - name: Build patched APK
+        id: build
+        if: ${{ steps.check.outputs.should_build == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD || 'tlqkftorl01!' }}
+          SIGNING_KEYSTORE_ALIAS: ${{ secrets.SIGNING_KEYSTORE_ALIAS || 'revanced' }}
+        run: |
+          python3 scripts/build_dcinside.py build --patches-tag "${{ steps.check.outputs.patches_tag }}"
+
+      - name: Attest APK
+        if: ${{ steps.check.outputs.should_build == 'true' }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.apk
+
+      - name: Publish GitHub release
+        if: ${{ steps.check.outputs.should_build == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.build.outputs.patches_tag }}
+          TITLE: ${{ steps.build.outputs.release_title }}
+          PRERELEASE: ${{ steps.build.outputs.prerelease }}
+          NOTES: ${{ steps.build.outputs.release_notes }}
+        run: |
+          release_flags=()
+          if [ "${PRERELEASE}" = "true" ]; then
+            release_flags+=(--prerelease)
+          else
+            release_flags+=(--latest)
+          fi
+          gh release create "${TAG}" dist/*.apk dist/*.json \
+            --title "${TITLE}" \
+            --notes-file "${NOTES}" \
+            "${release_flags[@]}"
+
+      - name: Upload workflow artifact
+        if: ${{ steps.check.outputs.should_build == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcinside-${{ steps.build.outputs.patches_tag }}
+          path: |
+            dist/*.apk
+            dist/*.json
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error

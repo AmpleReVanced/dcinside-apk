@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      patches_tag:
+        description: "Specific AmpleReVanced/revanced-patches tag. Empty means latest release, including prereleases."
+        required: false
+        type: string
+      force:
+        description: "Build even if this repository already has a release for the patches tag."
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: dcinside-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      patches_tag: ${{ steps.check.outputs.patches_tag }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check upstream patches release
+        id: check
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PATCHES_TAG: ${{ github.event.inputs.patches_tag || '' }}
+          FORCE_BUILD: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          args=()
+          if [ -n "${PATCHES_TAG}" ]; then
+            args+=(--patches-tag "${PATCHES_TAG}")
+          fi
+          if [ "${FORCE_BUILD}" = "true" ]; then
+            args+=(--force)
+          fi
+          python3 scripts/build_dcinside.py check "${args[@]}"
+
+  build:
+    needs: check
+    if: ${{ needs.check.outputs.should_build == 'true' }}
+    uses: ./.github/workflows/build.yml
+    with:
+      patches_tag: ${{ needs.check.outputs.patches_tag }}
+      force: ${{ github.event.inputs.force == 'true' }}
+    secrets: inherit

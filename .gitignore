@@ -1,0 +1,8 @@
+dist/
+work/
+__pycache__/
+*-temporary-files/
+*.jks
+*.keystore
+*.p12
+*.tmp
