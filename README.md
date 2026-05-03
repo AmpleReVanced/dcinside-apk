@@ -3,6 +3,8 @@ This repository use GitHub Actions to automatically patch APKs.
 
 It use Release Attestations to provide trusted APKs.
 
+It use [Ample ReVanced patches](https://github.com/AmpleReVanced/revanced-patches)
+
 ## Automation
 
 `CI` polls `AmpleReVanced/revanced-patches` releases hourly, including prereleases. If the upstream tag has not been released here yet, `Build` creates both APKs:
