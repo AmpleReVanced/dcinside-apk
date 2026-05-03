@@ -1,1 +1,3 @@
 cloudscraper @ git+https://github.com/venomous/cloudscraper.git
+curl_cffi
+wreq
