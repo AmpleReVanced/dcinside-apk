@@ -1,1 +1,1 @@
-cloudscraper>=1.2.71,<2
+cloudscraper @ git+https://github.com/venomous/cloudscraper.git

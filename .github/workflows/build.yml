@@ -71,7 +71,7 @@ jobs:
       - name: Install Python dependencies
         if: ${{ steps.check.outputs.should_build == 'true' }}
         run: |
-          python3 -m pip install -r requirements.txt
+          python3 -m pip install --upgrade -r requirements.txt
 
       - name: Build patched APK
         id: build

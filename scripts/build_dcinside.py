@@ -295,7 +295,18 @@ def apkpure_scraper() -> Any:
     except ImportError as exc:
         raise BuildError("Missing cloudscraper. Run `python3 -m pip install -r requirements.txt`.") from exc
 
-    scraper = cloudscraper.create_scraper()
+    version = getattr(cloudscraper, "__version__", "unknown")
+    log(f"using cloudscraper {version}")
+    scraper = cloudscraper.create_scraper(
+        auto_refresh_on_403=True,
+        max_403_retries=2,
+        min_request_interval=0.1,
+        stealth_options={
+            "human_like_delays": False,
+            "randomize_headers": True,
+            "browser_quirks": True,
+        },
+    )
     scraper.headers.update({"User-Agent": UA})
     return scraper
 
