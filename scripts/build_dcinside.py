@@ -16,7 +16,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +24,12 @@ PATCHES_REPO = "AmpleReVanced/revanced-patches"
 CLI_REPO = "MorpheApp/morphe-cli"
 APKEDITOR_REPO = "REAndroid/APKEditor"
 PACKAGE_NAME = "com.dcinside.app.android"
-UPTODOWN_PAGE = "https://dcinside.kr.uptodown.com/android/dw"
+APKPURE_PAGE = (
+    "https://apkpure.com/kr/%EB%94%94%EC%8B%9C%EC%9D%B8%EC%82%AC%EC%9D%B4%EB%93%9C-dcinside/"
+    f"{PACKAGE_NAME}/download"
+)
+APKPURE_ARCH = "arm64-v8a"
+APKPURE_SV = os.environ.get("APKPURE_SV", "23")
 KEYSTORE_ALIAS = os.environ.get("KEYSTORE_ALIAS") or os.environ.get("SIGNING_KEYSTORE_ALIAS") or "revanced"
 KEYSTORE_PASSWORD = os.environ.get("KEYSTORE_PASSWORD") or os.environ.get("SIGNING_KEYSTORE_PASSWORD") or "tlqkftorl01!"
 SIGNER_NAME = os.environ.get("SIGNER_NAME") or KEYSTORE_ALIAS
@@ -278,48 +282,147 @@ def download_github_asset(release: dict[str, Any], patterns: list[str], output: 
     return name
 
 
-def fetch_uptodown_page() -> str:
-    return read_url(UPTODOWN_PAGE).decode("utf-8", errors="replace")
+def apkpure_download_url(version_code: str) -> str:
+    return (
+        f"https://d.apkpure.com/b/XAPK/{PACKAGE_NAME}"
+        f"?versionCode={version_code}&nc={APKPURE_ARCH}&sv={APKPURE_SV}"
+    )
 
 
-def extract_uptodown_info(page: str) -> dict[str, str]:
+def apkpure_scraper() -> Any:
+    try:
+        import cloudscraper  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise BuildError("Missing cloudscraper. Run `python3 -m pip install -r requirements.txt`.") from exc
+
+    return cloudscraper.create_scraper(
+        interpreter="js2py",
+        delay=5,
+        browser={
+            "browser": "chrome",
+            "platform": "windows",
+            "desktop": True,
+        },
+    )
+
+
+def fetch_apkpure_page(scraper: Any) -> str:
+    log(f"fetching APKPure page with cloudscraper: {APKPURE_PAGE}")
+    response = scraper.get(
+        APKPURE_PAGE,
+        headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "User-Agent": UA,
+        },
+        timeout=180,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def text_content(markup: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", markup)).strip()
+
+
+def extract_apkpure_info(page: str) -> dict[str, str]:
     unescaped = html.unescape(page)
-    button = re.search(r'<button[^>]+id="detail-download-button"[^>]*>', unescaped)
-    if not button:
-        raise BuildError("Could not find Uptodown download button")
-
-    button_html = button.group(0)
-    token_match = re.search(r'data-url="([^"]+)"', button_html)
-    version_id_match = re.search(r'data-download-version="([^"]+)"', button_html)
-    if not token_match:
-        raise BuildError("Could not extract Uptodown download token")
-
-    token_value = token_match.group(1)
-    version_id = version_id_match.group(1) if version_id_match else "latest"
-
+    visible_text = text_content(unescaped)
+    version_code = ""
     version_name = ""
-    title = re.search(r"<title>.*?(\d+(?:\.\d+)+).*?</title>", unescaped, re.DOTALL)
-    if title:
-        version_name = title.group(1)
-    if not version_name:
-        detail_version = re.search(r'<div class="version">([^<]+)</div>', unescaped)
-        if detail_version:
-            version_name = detail_version.group(1).strip()
-    if not version_name:
-        version_name = version_id
 
-    if token_value.startswith(("http://", "https://")):
-        download_url = token_value
-    else:
-        download_url = urllib.parse.urljoin("https://dw.uptodown.com/dwn/", token_value)
+    link_rx = re.compile(
+        rf"(?:https?:)?//d\.apkpure\.com/b/XAPK/{re.escape(PACKAGE_NAME)}\?[^\"'\s<>]+",
+        re.IGNORECASE,
+    )
+    for raw_link in link_rx.findall(unescaped):
+        if raw_link.startswith("//"):
+            raw_link = "https:" + raw_link
+        parsed = urllib.parse.urlparse(raw_link)
+        query = urllib.parse.parse_qs(parsed.query)
+        if query.get("nc", [""])[0] != APKPURE_ARCH:
+            continue
+        version_code = query.get("versionCode", [""])[0]
+        version_name = query.get("version", [""])[0]
+        if version_code:
+            break
+
+    if not version_code:
+        arm64_block = re.search(
+            rf"{re.escape(APKPURE_ARCH)}.*?(\d+(?:\.\d+)+)\s*\((\d+)\)\s*XAPK",
+            visible_text,
+            re.IGNORECASE,
+        )
+        if arm64_block:
+            version_name, version_code = arm64_block.groups()
+
+    if not version_code:
+        generic = re.search(r"versionCode=(\d+)", unescaped)
+        if generic:
+            version_code = generic.group(1)
+
+    if not version_name:
+        by_code = re.search(rf"(\d+(?:\.\d+)+)\s*\({re.escape(version_code)}\)\s*XAPK", visible_text)
+        if by_code:
+            version_name = by_code.group(1)
+
+    if not version_name:
+        for pattern in (
+            r"Download APK\s+(\d+(?:\.\d+)+)",
+            r"최신 버전\s+(\d+(?:\.\d+)+)",
+            r"<title>.*?(\d+(?:\.\d+)+).*?</title>",
+        ):
+            match = re.search(pattern, unescaped if "<title>" in pattern else visible_text, re.DOTALL)
+            if match:
+                version_name = match.group(1)
+                break
+
+    if not version_code:
+        raise BuildError(f"Could not extract APKPure {APKPURE_ARCH} versionCode")
+    if not version_name:
+        version_name = version_code
 
     return {
         "version_name": version_name,
-        "version_code": version_id,
-        "download_url": download_url,
-        "source": "uptodown",
-        "source_page": UPTODOWN_PAGE,
+        "version_code": version_code,
+        "download_url": apkpure_download_url(version_code),
+        "source": "apkpure",
+        "source_page": APKPURE_PAGE,
+        "architecture": APKPURE_ARCH,
     }
+
+
+def download_apkpure_xapk(scraper: Any, url: str, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists() and output.stat().st_size > 0:
+        log(f"{output} already exists")
+        return
+
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    log(f"downloading APKPure XAPK with cloudscraper: {url}")
+    response = scraper.get(
+        url,
+        headers={
+            "Accept": "application/octet-stream,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": APKPURE_PAGE,
+            "User-Agent": UA,
+        },
+        stream=True,
+        timeout=300,
+    )
+    try:
+        response.raise_for_status()
+        with open(tmp, "wb") as fh:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+    finally:
+        response.close()
+    tmp.replace(output)
 
 
 def run(cmd: list[str]) -> None:
@@ -372,16 +475,6 @@ def merge_xapk(apkeditor: Path, xapk: Path, output: Path) -> None:
         log(f"{output} already exists")
         return
     run(["java", "-jar", str(apkeditor), "merge", "-i", str(xapk), "-o", str(output), "-clean-meta", "-f"])
-
-
-def is_android_apk(path: Path) -> bool:
-    if not zipfile.is_zipfile(path):
-        return False
-    try:
-        with zipfile.ZipFile(path) as archive:
-            return "AndroidManifest.xml" in set(archive.namelist())
-    except zipfile.BadZipFile:
-        return False
 
 
 def patch_apk(
@@ -466,8 +559,8 @@ def write_release_files(
     notes_lines = [
         f"# {title}",
         "",
-        f"- DCInside: `{app_info['version_name']}` (`{app_info['version_code']}`, `{input_kind.upper()}`)",
-        f"- Source: [Uptodown]({app_info.get('source_page', UPTODOWN_PAGE)})",
+        f"- DCInside: `{app_info['version_name']}` (`{app_info['version_code']}`, `{APKPURE_ARCH}`, `{input_kind.upper()}`)",
+        f"- Source: [APKPure]({app_info.get('source_page', APKPURE_PAGE)})",
         f"- Patches: [{patches_release['tag_name']}]({patches_release['html_url']}) (`{patches_asset}`)",
         f"- Morphe CLI: [{cli_release['tag_name']}]({cli_release['html_url']}) (`{cli_asset}`)",
     ]
@@ -477,7 +570,7 @@ def write_release_files(
         )
     notes_lines.extend(
         [
-            f"- Uptodown download id: `{app_info['version_code']}`",
+            f"- APKPure URL: `{app_info['download_url']}`",
             f"- Unclone APK: `{unclone_apk.name}`",
             f"- Unclone SHA-256: `{unclone_hash}`",
             f"- Clone APK: `{clone_apk.name}`",
@@ -504,8 +597,9 @@ def write_release_files(
             "package": PACKAGE_NAME,
             "version_name": app_info["version_name"],
             "version_code": app_info["version_code"],
-            "source": app_info.get("source", "uptodown"),
-            "source_page": app_info.get("source_page", UPTODOWN_PAGE),
+            "architecture": APKPURE_ARCH,
+            "source": app_info.get("source", "apkpure"),
+            "source_page": app_info.get("source_page", APKPURE_PAGE),
             "download_url": app_info["download_url"],
             "input_type": input_kind,
         },
@@ -562,51 +656,42 @@ def build(args: argparse.Namespace) -> None:
 
     patches_release = resolve_patches_release(args.patches_tag)
     cli_release = latest_release(CLI_REPO, include_prereleases=False)
+    apkeditor_release = latest_release(APKEDITOR_REPO, include_prereleases=False)
 
     patches_file = bins / "patches.mpp"
     cli_file = bins / "morphe-cli.jar"
+    apkeditor_file = bins / "apkeditor.jar"
     patches_asset = download_github_asset(patches_release, [r"^patches.*\.mpp$"], patches_file)
     cli_asset = download_github_asset(cli_release, [r"^morphe-cli.*-all\.jar$"], cli_file)
+    apkeditor_asset = download_github_asset(apkeditor_release, [r"^APKEditor.*\.jar$"], apkeditor_file)
     keystore, keystore_source = prepare_keystore(work)
 
-    app_info = extract_uptodown_info(fetch_uptodown_page())
-    log(f"Using latest Uptodown release: version={app_info['version_name']} id={app_info['version_code']}")
+    scraper = apkpure_scraper()
+    app_info = extract_apkpure_info(fetch_apkpure_page(scraper))
+    log(
+        f"Using latest APKPure {APKPURE_ARCH} release: "
+        f"version={app_info['version_name']} versionCode={app_info['version_code']}"
+    )
     last_commit = patches_commit(patches_release)
     version_part = file_part(app_info["version_name"])
-    source_archive = work / f"{PACKAGE_NAME}-{app_info['version_code']}-uptodown.xapk"
-    stock_apk = work / f"{PACKAGE_NAME}-{app_info['version_code']}-uptodown.apk"
+    xapk = work / f"{PACKAGE_NAME}-{app_info['version_code']}-{APKPURE_ARCH}.xapk"
+    merged = work / f"{PACKAGE_NAME}-{app_info['version_code']}-{APKPURE_ARCH}-merged.apk"
     unclone_apk = dist / f"dcinside-{version_part}-revanced-{last_commit}-unclone.apk"
     clone_apk = dist / f"dcinside-{version_part}-revanced-{last_commit}-clone.apk"
     metadata_path = dist / "metadata.json"
 
-    download_file(app_info["download_url"], source_archive, referer=UPTODOWN_PAGE)
-    apkeditor_release: dict[str, Any] | None = None
-    apkeditor_asset: str | None = None
-    if is_android_apk(source_archive):
-        if not stock_apk.exists():
-            shutil.copy2(source_archive, stock_apk)
-        input_apk = stock_apk
-        input_kind = "apk"
-        log("Uptodown source is a single APK; skipping APKEditor merge")
-    else:
-        if not zipfile.is_zipfile(source_archive):
-            raise BuildError(f"Downloaded Uptodown file is not a valid APK/XAPK zip: {source_archive}")
-        apkeditor_release = latest_release(APKEDITOR_REPO, include_prereleases=False)
-        apkeditor_file = bins / "apkeditor.jar"
-        apkeditor_asset = download_github_asset(apkeditor_release, [r"^APKEditor.*\.jar$"], apkeditor_file)
-        input_apk = work / f"{PACKAGE_NAME}-{app_info['version_code']}-uptodown-merged.apk"
-        input_kind = "xapk"
-        merge_xapk(apkeditor_file, source_archive, input_apk)
+    download_apkpure_xapk(scraper, app_info["download_url"], xapk)
+    merge_xapk(apkeditor_file, xapk, merged)
 
     log("Building Unclone APK...")
-    patch_apk(cli_file, patches_file, input_apk, unclone_apk, keystore)
+    patch_apk(cli_file, patches_file, merged, unclone_apk, keystore)
     log(f"Unclone APK generated: {unclone_apk}")
 
     log("Building Clone APK...")
     patch_apk(
         cli_file,
         patches_file,
-        input_apk,
+        merged,
         clone_apk,
         keystore,
         [
@@ -634,7 +719,7 @@ def build(args: argparse.Namespace) -> None:
         cli_asset=cli_asset,
         apkeditor_asset=apkeditor_asset,
         app_info=app_info,
-        input_kind=input_kind,
+        input_kind="xapk",
         keystore_source=keystore_source,
     )
     outputs.update(

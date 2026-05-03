@@ -38,6 +38,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
@@ -60,6 +65,11 @@ jobs:
             args+=(--force)
           fi
           python3 scripts/build_dcinside.py check "${args[@]}"
+
+      - name: Install Python dependencies
+        if: ${{ steps.check.outputs.should_build == 'true' }}
+        run: |
+          python3 -m pip install -r requirements.txt
 
       - name: Build patched APK
         id: build
