@@ -295,15 +295,9 @@ def apkpure_scraper() -> Any:
     except ImportError as exc:
         raise BuildError("Missing cloudscraper. Run `python3 -m pip install -r requirements.txt`.") from exc
 
-    return cloudscraper.create_scraper(
-        interpreter="js2py",
-        delay=5,
-        browser={
-            "browser": "chrome",
-            "platform": "windows",
-            "desktop": True,
-        },
-    )
+    scraper = cloudscraper.create_scraper()
+    scraper.headers.update({"User-Agent": UA})
+    return scraper
 
 
 def fetch_apkpure_page(scraper: Any) -> str:
@@ -315,7 +309,7 @@ def fetch_apkpure_page(scraper: Any) -> str:
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
             "User-Agent": UA,
         },
-        timeout=180,
+        timeout=60,
     )
     response.raise_for_status()
     return response.text
