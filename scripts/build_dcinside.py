@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -32,6 +33,8 @@ APKPURE_PAGE = (
 APKPURE_ARCH = "arm64-v8a"
 APKPURE_SV = os.environ.get("APKPURE_SV", "23")
 APKPURE_CLIENT_ATTEMPTS = int(os.environ.get("APKPURE_CLIENT_ATTEMPTS", "2"))
+APKPURE_PAGE_ATTEMPT_TIMEOUT = int(os.environ.get("APKPURE_PAGE_ATTEMPT_TIMEOUT", "45"))
+APKPURE_DOWNLOAD_ATTEMPT_TIMEOUT = int(os.environ.get("APKPURE_DOWNLOAD_ATTEMPT_TIMEOUT", "420"))
 KEYSTORE_ALIAS = os.environ.get("KEYSTORE_ALIAS") or os.environ.get("SIGNING_KEYSTORE_ALIAS") or "revanced"
 KEYSTORE_PASSWORD = os.environ.get("KEYSTORE_PASSWORD") or os.environ.get("SIGNING_KEYSTORE_PASSWORD") or "tlqkftorl01!"
 SIGNER_NAME = os.environ.get("SIGNER_NAME") or KEYSTORE_ALIAS
@@ -42,6 +45,10 @@ UA = (
 
 
 class BuildError(RuntimeError):
+    pass
+
+
+class ApkpureAttemptTimeout(TimeoutError):
     pass
 
 
@@ -529,14 +536,31 @@ def apkpure_attempts() -> int:
     return max(1, APKPURE_CLIENT_ATTEMPTS)
 
 
-def with_apkpure_fallback(clients: list[Any], action: str, call: Any) -> Any:
+def run_with_hard_timeout(timeout_seconds: int, call: Any) -> Any:
+    if timeout_seconds <= 0 or not hasattr(signal, "SIGALRM") or not hasattr(signal, "ITIMER_REAL"):
+        return call()
+
+    def timeout_handler(_signum: int, _frame: Any) -> None:
+        raise ApkpureAttemptTimeout(f"timed out after {timeout_seconds}s")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def with_apkpure_fallback(clients: list[Any], action: str, timeout_seconds: int, call: Any) -> Any:
     errors: list[str] = []
     attempts = apkpure_attempts()
     for client in clients:
         for attempt in range(1, attempts + 1):
             started = time.monotonic()
             try:
-                result = call(client)
+                result = run_with_hard_timeout(timeout_seconds, lambda: call(client))
             except Exception as exc:
                 elapsed = time.monotonic() - started
                 message = f"{client.name} attempt {attempt}/{attempts}: {type(exc).__name__}: {exc}"
@@ -554,7 +578,12 @@ def with_apkpure_fallback(clients: list[Any], action: str, call: Any) -> Any:
 
 def fetch_apkpure_page(clients: list[Any]) -> str:
     log(f"fetching APKPure page: {APKPURE_PAGE}")
-    return with_apkpure_fallback(clients, "page fetch", lambda client: client.fetch_page())
+    return with_apkpure_fallback(
+        clients,
+        "page fetch",
+        APKPURE_PAGE_ATTEMPT_TIMEOUT,
+        lambda client: client.fetch_page(),
+    )
 
 
 def fetch_apkpure_info(clients: list[Any]) -> dict[str, str]:
@@ -562,6 +591,7 @@ def fetch_apkpure_info(clients: list[Any]) -> dict[str, str]:
     return with_apkpure_fallback(
         clients,
         "page fetch",
+        APKPURE_PAGE_ATTEMPT_TIMEOUT,
         lambda client: extract_apkpure_info(client.fetch_page()),
     )
 
@@ -650,14 +680,19 @@ def download_apkpure_xapk(clients: list[Any], url: str, output: Path) -> None:
     def download_with_client(client: Any) -> None:
         if tmp.exists():
             tmp.unlink()
-        client.download_xapk(url, tmp)
-        if not tmp.exists() or tmp.stat().st_size == 0:
-            raise BuildError(f"{client.name} produced an empty XAPK")
-        if not zipfile.is_zipfile(tmp):
-            raise BuildError(f"{client.name} produced a non-ZIP XAPK")
+        try:
+            client.download_xapk(url, tmp)
+            if not tmp.exists() or tmp.stat().st_size == 0:
+                raise BuildError(f"{client.name} produced an empty XAPK")
+            if not zipfile.is_zipfile(tmp):
+                raise BuildError(f"{client.name} produced a non-ZIP XAPK")
+        except Exception:
+            if tmp.exists():
+                tmp.unlink()
+            raise
 
     log(f"downloading APKPure XAPK: {url}")
-    with_apkpure_fallback(clients, "XAPK download", download_with_client)
+    with_apkpure_fallback(clients, "XAPK download", APKPURE_DOWNLOAD_ATTEMPT_TIMEOUT, download_with_client)
     tmp.replace(output)
 
 
