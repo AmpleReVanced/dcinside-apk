@@ -5,12 +5,10 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import html
 import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -30,11 +28,13 @@ APKPURE_PAGE = (
     "https://apkpure.com/kr/%EB%94%94%EC%8B%9C%EC%9D%B8%EC%82%AC%EC%9D%B4%EB%93%9C-dcinside/"
     f"{PACKAGE_NAME}/download"
 )
+APKPURE_APP_VERSION_API = "https://api.pureapk.com/m/v3/cms/app_version"
 APKPURE_ARCH = "arm64-v8a"
-APKPURE_SV = os.environ.get("APKPURE_SV", "23")
-APKPURE_CLIENT_ATTEMPTS = int(os.environ.get("APKPURE_CLIENT_ATTEMPTS", "2"))
-APKPURE_PAGE_ATTEMPT_TIMEOUT = int(os.environ.get("APKPURE_PAGE_ATTEMPT_TIMEOUT", "45"))
-APKPURE_DOWNLOAD_ATTEMPT_TIMEOUT = int(os.environ.get("APKPURE_DOWNLOAD_ATTEMPT_TIMEOUT", "420"))
+APKPURE_HL = os.environ.get("APKPURE_HL", "en-US")
+APKPURE_X_CV = os.environ.get("APKPURE_X_CV", "3172501")
+APKPURE_X_SV = os.environ.get("APKPURE_X_SV", "29")
+APKPURE_X_ABIS = os.environ.get("APKPURE_X_ABIS", APKPURE_ARCH)
+APKPURE_X_GP = os.environ.get("APKPURE_X_GP", "1")
 KEYSTORE_ALIAS = os.environ.get("KEYSTORE_ALIAS") or os.environ.get("SIGNING_KEYSTORE_ALIAS") or "revanced"
 KEYSTORE_PASSWORD = os.environ.get("KEYSTORE_PASSWORD") or os.environ.get("SIGNING_KEYSTORE_PASSWORD") or "tlqkftorl01!"
 SIGNER_NAME = os.environ.get("SIGNER_NAME") or KEYSTORE_ALIAS
@@ -45,10 +45,6 @@ UA = (
 
 
 class BuildError(RuntimeError):
-    pass
-
-
-class ApkpureAttemptTimeout(TimeoutError):
     pass
 
 
@@ -291,409 +287,163 @@ def download_github_asset(release: dict[str, Any], patterns: list[str], output: 
     return name
 
 
-def apkpure_download_url(version_code: str) -> str:
-    return (
-        f"https://d.apkpure.com/b/XAPK/{PACKAGE_NAME}"
-        f"?versionCode={version_code}&nc={APKPURE_ARCH}&sv={APKPURE_SV}"
-    )
+DOWNLOAD_RE = re.compile(
+    rb"(X?APKJ).."
+    rb"(https?://(?:www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}"
+    rb"\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_+.~#?&//=]*)"
+)
 
 
-def apkpure_headers(*, accept: str, referer: str | None = None) -> dict[str, str]:
-    headers = {
-        "Accept": accept,
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "User-Agent": UA,
-    }
-    if referer:
-        headers["Referer"] = referer
-    return headers
+def apkpure_api_url() -> str:
+    query = urllib.parse.urlencode({"hl": APKPURE_HL, "package_name": PACKAGE_NAME})
+    return f"{APKPURE_APP_VERSION_API}?{query}"
 
 
-def response_status_code(response: Any) -> int:
-    status_code = getattr(response, "status_code", None)
-    if status_code is not None:
-        return int(status_code)
-
-    status = getattr(response, "status")
-    as_u16 = getattr(status, "as_u16", None)
-    if callable(as_u16):
-        return int(as_u16())
-    return int(str(status).split()[0])
-
-
-def response_text(response: Any) -> str:
-    text = getattr(response, "text")
-    if callable(text):
-        return str(text())
-    return str(text)
-
-
-def close_response(response: Any) -> None:
-    close = getattr(response, "close", None)
-    if callable(close):
-        close()
-
-
-def ensure_success(response: Any) -> None:
-    status = response_status_code(response)
-    if status >= 400:
-        raise BuildError(f"HTTP {status}")
-
-    raise_for_status = getattr(response, "raise_for_status", None)
-    if callable(raise_for_status):
-        raise_for_status()
-
-
-def write_response_body(response: Any, output: Path) -> None:
-    iter_content = getattr(response, "iter_content", None)
-    if callable(iter_content):
-        with open(output, "wb") as fh:
-            for chunk in iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    fh.write(chunk)
-        return
-
-    body_method = getattr(response, "bytes", None)
-    if callable(body_method):
-        body = body_method()
-    else:
-        body = getattr(response, "content", None)
-    if body is None:
-        raise BuildError("Response body is unavailable")
-    with open(output, "wb") as fh:
-        fh.write(body)
-
-
-class CloudscraperApkpureClient:
-    name = "cloudscraper"
-
-    def __init__(self) -> None:
-        import cloudscraper  # type: ignore[import-not-found]
-
-        version = getattr(cloudscraper, "__version__", "unknown")
-        log(f"using cloudscraper {version}")
-        try:
-            self.scraper = cloudscraper.create_scraper(
-                auto_refresh_on_403=False,
-                max_403_retries=0,
-                min_request_interval=0.1,
-                stealth_options={
-                    "human_like_delays": False,
-                    "randomize_headers": True,
-                    "browser_quirks": True,
-                },
-            )
-        except TypeError:
-            self.scraper = cloudscraper.create_scraper()
-        self.scraper.headers.update({"User-Agent": UA})
-
-    def fetch_page(self) -> str:
-        response = self.scraper.get(
-            APKPURE_PAGE,
-            headers=apkpure_headers(accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-            timeout=25,
-        )
-        ensure_success(response)
-        return response_text(response)
-
-    def download_xapk(self, url: str, output: Path) -> None:
-        response = self.scraper.get(
-            url,
-            headers=apkpure_headers(accept="application/octet-stream,*/*;q=0.8", referer=APKPURE_PAGE),
-            stream=True,
-            timeout=300,
-        )
-        try:
-            ensure_success(response)
-            write_response_body(response, output)
-        finally:
-            close_response(response)
-
-    def close(self) -> None:
-        close = getattr(self.scraper, "close", None)
-        if callable(close):
-            close()
-
-
-class CurlCffiApkpureClient:
-    name = "curl_cffi"
-
-    def __init__(self) -> None:
-        import curl_cffi  # type: ignore[import-not-found]
-        from curl_cffi import requests as curl_requests  # type: ignore[import-not-found]
-
-        version = getattr(curl_cffi, "__version__", "unknown")
-        log(f"using curl_cffi {version}")
-        self.session = curl_requests.Session()
-
-    def fetch_page(self) -> str:
-        response = self.session.get(
-            APKPURE_PAGE,
-            headers=apkpure_headers(accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-            impersonate="chrome",
-            timeout=25,
-        )
-        ensure_success(response)
-        return response_text(response)
-
-    def download_xapk(self, url: str, output: Path) -> None:
-        response = self.session.get(
-            url,
-            headers=apkpure_headers(accept="application/octet-stream,*/*;q=0.8", referer=APKPURE_PAGE),
-            impersonate="chrome",
-            stream=True,
-            timeout=300,
-        )
-        try:
-            ensure_success(response)
-            write_response_body(response, output)
-        finally:
-            close_response(response)
-
-    def close(self) -> None:
-        close = getattr(self.session, "close", None)
-        if callable(close):
-            close()
-
-
-class WreqApkpureClient:
-    name = "wreq"
-
-    def __init__(self) -> None:
-        import wreq  # type: ignore[import-not-found]
-        from wreq.blocking import Client  # type: ignore[import-not-found]
-        from wreq.emulation import Emulation  # type: ignore[import-not-found]
-
-        version = getattr(wreq, "__version__", "unknown")
-        log(f"using wreq {version}")
-        emulation = (
-            getattr(Emulation, "Chrome137", None)
-            or getattr(Emulation, "Firefox149", None)
-            or getattr(Emulation, "Firefox139", None)
-            or getattr(Emulation, "Safari26", None)
-        )
-        client_kwargs: dict[str, Any] = {"emulation": emulation} if emulation is not None else {}
-        try:
-            self.client = Client(cookie_store=True, **client_kwargs)
-        except TypeError:
-            self.client = Client(**client_kwargs)
-
-    def fetch_page(self) -> str:
-        import datetime
-
-        response = self.client.get(
-            APKPURE_PAGE,
-            headers=apkpure_headers(accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-            timeout=datetime.timedelta(seconds=25),
-        )
-        ensure_success(response)
-        return response_text(response)
-
-    def download_xapk(self, url: str, output: Path) -> None:
-        import datetime
-
-        response = self.client.get(
-            url,
-            headers=apkpure_headers(accept="application/octet-stream,*/*;q=0.8", referer=APKPURE_PAGE),
-            timeout=datetime.timedelta(seconds=300),
-        )
-        try:
-            ensure_success(response)
-            write_response_body(response, output)
-        finally:
-            close_response(response)
-
-    def close(self) -> None:
-        close = getattr(self.client, "close", None)
-        if callable(close):
-            close()
-
-
-def apkpure_clients() -> list[Any]:
-    clients: list[Any] = []
-    for factory in (CloudscraperApkpureClient, CurlCffiApkpureClient, WreqApkpureClient):
-        try:
-            clients.append(factory())
-        except ImportError as exc:
-            log(f"skipping {factory.name}: missing {exc.name}")
-        except Exception as exc:
-            log(f"skipping {factory.name}: {type(exc).__name__}: {exc}")
-
-    if not clients:
-        raise BuildError("No APKPure HTTP clients are available. Run `python3 -m pip install -r requirements.txt`.")
-    return clients
-
-
-def close_apkpure_clients(clients: list[Any]) -> None:
-    for client in clients:
-        try:
-            client.close()
-        except Exception as exc:
-            log(f"failed to close {client.name}: {type(exc).__name__}: {exc}")
-
-
-def apkpure_attempts() -> int:
-    return max(1, APKPURE_CLIENT_ATTEMPTS)
-
-
-def run_with_hard_timeout(timeout_seconds: int, call: Any) -> Any:
-    if timeout_seconds <= 0 or not hasattr(signal, "SIGALRM") or not hasattr(signal, "ITIMER_REAL"):
-        return call()
-
-    def timeout_handler(_signum: int, _frame: Any) -> None:
-        raise ApkpureAttemptTimeout(f"timed out after {timeout_seconds}s")
-
-    previous_handler = signal.getsignal(signal.SIGALRM)
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-    try:
-        return call()
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
-
-
-def with_apkpure_fallback(clients: list[Any], action: str, timeout_seconds: int, call: Any) -> Any:
-    errors: list[str] = []
-    attempts = apkpure_attempts()
-    for client in clients:
-        for attempt in range(1, attempts + 1):
-            started = time.monotonic()
-            try:
-                result = run_with_hard_timeout(timeout_seconds, lambda: call(client))
-            except Exception as exc:
-                elapsed = time.monotonic() - started
-                message = f"{client.name} attempt {attempt}/{attempts}: {type(exc).__name__}: {exc}"
-                errors.append(message)
-                log(f"APKPure {action} failed via {message} elapsed={elapsed:.1f}s")
-                if attempt < attempts:
-                    time.sleep(min(2 ** (attempt - 1), 5))
-            else:
-                elapsed = time.monotonic() - started
-                log(f"APKPure {action} succeeded via {client.name} attempt {attempt}/{attempts} elapsed={elapsed:.1f}s")
-                return result
-
-    raise BuildError(f"APKPure {action} failed with all clients: {'; '.join(errors)}")
-
-
-def fetch_apkpure_page(clients: list[Any]) -> str:
-    log(f"fetching APKPure page: {APKPURE_PAGE}")
-    return with_apkpure_fallback(
-        clients,
-        "page fetch",
-        APKPURE_PAGE_ATTEMPT_TIMEOUT,
-        lambda client: client.fetch_page(),
-    )
-
-
-def fetch_apkpure_info(clients: list[Any]) -> dict[str, str]:
-    log(f"fetching APKPure page: {APKPURE_PAGE}")
-    return with_apkpure_fallback(
-        clients,
-        "page fetch",
-        APKPURE_PAGE_ATTEMPT_TIMEOUT,
-        lambda client: extract_apkpure_info(client.fetch_page()),
-    )
-
-
-def text_content(markup: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", markup)).strip()
-
-
-def extract_apkpure_info(page: str) -> dict[str, str]:
-    unescaped = html.unescape(page)
-    visible_text = text_content(unescaped)
-    version_code = ""
-    version_name = ""
-
-    link_rx = re.compile(
-        rf"(?:https?:)?//d\.apkpure\.com/b/XAPK/{re.escape(PACKAGE_NAME)}\?[^\"'\s<>]+",
-        re.IGNORECASE,
-    )
-    for raw_link in link_rx.findall(unescaped):
-        if raw_link.startswith("//"):
-            raw_link = "https:" + raw_link
-        parsed = urllib.parse.urlparse(raw_link)
-        query = urllib.parse.parse_qs(parsed.query)
-        if query.get("nc", [""])[0] != APKPURE_ARCH:
-            continue
-        version_code = query.get("versionCode", [""])[0]
-        version_name = query.get("version", [""])[0]
-        if version_code:
-            break
-
-    if not version_code:
-        arm64_block = re.search(
-            rf"{re.escape(APKPURE_ARCH)}.*?(\d+(?:\.\d+)+)\s*\((\d+)\)\s*XAPK",
-            visible_text,
-            re.IGNORECASE,
-        )
-        if arm64_block:
-            version_name, version_code = arm64_block.groups()
-
-    if not version_code:
-        generic = re.search(r"versionCode=(\d+)", unescaped)
-        if generic:
-            version_code = generic.group(1)
-
-    if not version_name:
-        by_code = re.search(rf"(\d+(?:\.\d+)+)\s*\({re.escape(version_code)}\)\s*XAPK", visible_text)
-        if by_code:
-            version_name = by_code.group(1)
-
-    if not version_name:
-        for pattern in (
-            r"Download APK\s+(\d+(?:\.\d+)+)",
-            r"최신 버전\s+(\d+(?:\.\d+)+)",
-            r"<title>.*?(\d+(?:\.\d+)+).*?</title>",
-        ):
-            match = re.search(pattern, unescaped if "<title>" in pattern else visible_text, re.DOTALL)
-            if match:
-                version_name = match.group(1)
-                break
-
-    if not version_code:
-        raise BuildError(f"Could not extract APKPure {APKPURE_ARCH} versionCode")
-    if not version_name:
-        version_name = version_code
-
+def apkpure_api_headers() -> dict[str, str]:
     return {
-        "version_name": version_name,
-        "version_code": version_code,
-        "download_url": apkpure_download_url(version_code),
-        "source": "apkpure",
-        "source_page": APKPURE_PAGE,
-        "architecture": APKPURE_ARCH,
+        "User-Agent": UA,
+        "Accept": "application/octet-stream,*/*;q=0.8",
+        "Accept-Encoding": "identity",
+        "x-cv": APKPURE_X_CV,
+        "x-sv": APKPURE_X_SV,
+        "x-abis": APKPURE_X_ABIS,
+        "x-gp": APKPURE_X_GP,
     }
 
 
-def download_apkpure_xapk(clients: list[Any], url: str, output: Path) -> None:
+def fetch_apkpure_app_version() -> bytes:
+    url = apkpure_api_url()
+    log(f"fetching APKPure app_version API: {url}")
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(url, headers=apkpure_api_headers())
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = response.read()
+            if not data:
+                raise BuildError("APKPure app_version API returned an empty response")
+            log(f"APKPure app_version API fetched {len(data)} bytes on attempt {attempt}/3")
+            return data
+        except Exception as exc:
+            last_error = exc
+            log(f"APKPure app_version API attempt {attempt}/3 failed: {type(exc).__name__}: {exc}")
+            if attempt < 3:
+                time.sleep(2 ** (attempt - 1))
+
+    raise BuildError(f"APKPure app_version API failed: {last_error}")
+
+
+def clean_meta_value(value: str) -> str:
+    return re.split(r"[\x00-\x1f\x7f]", value, maxsplit=1)[0]
+
+
+def decode_url_meta(url: str) -> dict[str, str]:
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    c_value = query.get("c", [""])[0]
+    parts = c_value.split("|")
+    if len(parts) < 3:
+        return {}
+
+    payload_b64 = parts[2]
+    payload_b64 += "=" * (-len(payload_b64) % 4)
+    try:
+        payload = base64.urlsafe_b64decode(payload_b64).decode("utf-8", errors="replace")
+    except Exception:
+        return {}
+
+    return {key: clean_meta_value(value) for key, value in urllib.parse.parse_qsl(payload)}
+
+
+def extract_apkpure_api_info(data: bytes) -> dict[str, str]:
+    candidates: list[dict[str, str]] = []
+    for match in DOWNLOAD_RE.finditer(data):
+        marker = match.group(1).decode("ascii")
+        url = match.group(2).decode("ascii", errors="replace")
+        artifact_type = "xapk" if marker == "XAPKJ" else "apk"
+        meta = decode_url_meta(url)
+        version_name = meta.get("vn") or ""
+        version_code = meta.get("vc") or ""
+        meta_type = meta.get("t") or artifact_type
+
+        if not version_name or not version_code:
+            continue
+        if meta_type and meta_type != artifact_type:
+            continue
+
+        candidates.append(
+            {
+                "version_name": version_name,
+                "version_code": version_code,
+                "download_url": url,
+                "artifact_type": artifact_type,
+                "source": "apkpure-api",
+                "source_page": apkpure_api_url(),
+                "web_page": APKPURE_PAGE,
+                "architecture": APKPURE_X_ABIS,
+                "size": meta.get("s") or "0",
+            }
+        )
+
+    if not candidates:
+        raise BuildError("Could not extract an APKPure APK/XAPK download URL from app_version API")
+
+    latest = candidates[0]
+    latest_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["version_name"] == latest["version_name"]
+        and candidate["version_code"] == latest["version_code"]
+    ]
+    artifact_type = "xapk" if any(candidate["artifact_type"] == "xapk" for candidate in latest_candidates) else "apk"
+    latest_candidates = [candidate for candidate in latest_candidates if candidate["artifact_type"] == artifact_type]
+    latest_candidates.sort(key=lambda candidate: int(candidate.get("size") or "0"), reverse=True)
+    return latest_candidates[0]
+
+
+def artifact_has_requested_abi(path: Path) -> bool:
+    if APKPURE_ARCH not in APKPURE_X_ABIS:
+        return True
+
+    wanted = f"config.{APKPURE_ARCH.replace('-', '_')}.apk"
+    split_abis = {
+        "config.arm64_v8a.apk",
+        "config.armeabi_v7a.apk",
+        "config.armeabi.apk",
+        "config.x86.apk",
+        "config.x86_64.apk",
+    }
+    with zipfile.ZipFile(path) as archive:
+        names = {Path(name).name for name in archive.namelist()}
+
+    if wanted in names:
+        return True
+    if names & split_abis:
+        return False
+    return True
+
+
+def fetch_apkpure_info() -> dict[str, str]:
+    return extract_apkpure_api_info(fetch_apkpure_app_version())
+
+
+def download_apkpure_artifact(app_info: dict[str, str], output: Path) -> None:
+    url = app_info["download_url"]
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() and output.stat().st_size > 0:
         log(f"{output} already exists")
         return
 
-    tmp = output.with_suffix(output.suffix + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
-
-    def download_with_client(client: Any) -> None:
-        if tmp.exists():
-            tmp.unlink()
-        try:
-            client.download_xapk(url, tmp)
-            if not tmp.exists() or tmp.stat().st_size == 0:
-                raise BuildError(f"{client.name} produced an empty XAPK")
-            if not zipfile.is_zipfile(tmp):
-                raise BuildError(f"{client.name} produced a non-ZIP XAPK")
-        except Exception:
-            if tmp.exists():
-                tmp.unlink()
-            raise
-
-    log(f"downloading APKPure XAPK: {url}")
-    with_apkpure_fallback(clients, "XAPK download", APKPURE_DOWNLOAD_ATTEMPT_TIMEOUT, download_with_client)
-    tmp.replace(output)
+    log(f"downloading APKPure artifact: {url}")
+    download_file(url, output, referer=APKPURE_PAGE)
+    if output.stat().st_size == 0:
+        output.unlink()
+        raise BuildError(f"APKPure artifact download is empty: {output}")
+    if not zipfile.is_zipfile(output):
+        output.unlink()
+        raise BuildError(f"APKPure artifact is not a valid APK/XAPK zip: {output}")
+    if app_info["artifact_type"] == "xapk" and not artifact_has_requested_abi(output):
+        output.unlink()
+        raise BuildError(f"APKPure XAPK does not contain {APKPURE_ARCH}: {output}")
 
 
 def run(cmd: list[str]) -> None:
@@ -830,7 +580,7 @@ def write_release_files(
     notes_lines = [
         f"# {title}",
         "",
-        f"- DCInside: `{app_info['version_name']}` (`{app_info['version_code']}`, `{APKPURE_ARCH}`, `{input_kind.upper()}`)",
+        f"- DCInside: `{app_info['version_name']}` (`{app_info['version_code']}`, `{app_info['architecture']}`, `{input_kind.upper()}`)",
         f"- Source: [APKPure]({app_info.get('source_page', APKPURE_PAGE)})",
         f"- Patches: [{patches_release['tag_name']}]({patches_release['html_url']}) (`{patches_asset}`)",
         f"- Morphe CLI: [{cli_release['tag_name']}]({cli_release['html_url']}) (`{cli_asset}`)",
@@ -868,9 +618,10 @@ def write_release_files(
             "package": PACKAGE_NAME,
             "version_name": app_info["version_name"],
             "version_code": app_info["version_code"],
-            "architecture": APKPURE_ARCH,
+            "architecture": app_info["architecture"],
             "source": app_info.get("source", "apkpure"),
             "source_page": app_info.get("source_page", APKPURE_PAGE),
+            "web_page": app_info.get("web_page", APKPURE_PAGE),
             "download_url": app_info["download_url"],
             "input_type": input_kind,
         },
@@ -927,46 +678,50 @@ def build(args: argparse.Namespace) -> None:
 
     patches_release = resolve_patches_release(args.patches_tag)
     cli_release = latest_release(CLI_REPO, include_prereleases=False)
-    apkeditor_release = latest_release(APKEDITOR_REPO, include_prereleases=False)
 
-    clients = apkpure_clients()
-    try:
-        app_info = fetch_apkpure_info(clients)
-        log(
-            f"Using latest APKPure {APKPURE_ARCH} release: "
-            f"version={app_info['version_name']} versionCode={app_info['version_code']}"
-        )
+    app_info = fetch_apkpure_info()
+    artifact_type = app_info["artifact_type"]
+    log(
+        f"Using latest APKPure API {artifact_type.upper()} {app_info['architecture']} release: "
+        f"version={app_info['version_name']} versionCode={app_info['version_code']}"
+    )
 
-        patches_file = bins / "patches.mpp"
-        cli_file = bins / "morphe-cli.jar"
-        apkeditor_file = bins / "apkeditor.jar"
-        patches_asset = download_github_asset(patches_release, [r"^patches.*\.mpp$"], patches_file)
-        cli_asset = download_github_asset(cli_release, [r"^morphe-cli.*-all\.jar$"], cli_file)
-        apkeditor_asset = download_github_asset(apkeditor_release, [r"^APKEditor.*\.jar$"], apkeditor_file)
-        keystore, keystore_source = prepare_keystore(work)
+    patches_file = bins / "patches.mpp"
+    cli_file = bins / "morphe-cli.jar"
+    apkeditor_file = bins / "apkeditor.jar"
+    patches_asset = download_github_asset(patches_release, [r"^patches.*\.mpp$"], patches_file)
+    cli_asset = download_github_asset(cli_release, [r"^morphe-cli.*-all\.jar$"], cli_file)
+    apkeditor_release = latest_release(APKEDITOR_REPO, include_prereleases=False) if artifact_type == "xapk" else None
+    apkeditor_asset = (
+        download_github_asset(apkeditor_release, [r"^APKEditor.*\.jar$"], apkeditor_file)
+        if apkeditor_release
+        else None
+    )
+    keystore, keystore_source = prepare_keystore(work)
 
-        last_commit = patches_commit(patches_release)
-        version_part = file_part(app_info["version_name"])
-        xapk = work / f"{PACKAGE_NAME}-{app_info['version_code']}-{APKPURE_ARCH}.xapk"
-        merged = work / f"{PACKAGE_NAME}-{app_info['version_code']}-{APKPURE_ARCH}-merged.apk"
-        unclone_apk = dist / f"dcinside-{version_part}-revanced-{last_commit}-unclone.apk"
-        clone_apk = dist / f"dcinside-{version_part}-revanced-{last_commit}-clone.apk"
-        metadata_path = dist / "metadata.json"
+    last_commit = patches_commit(patches_release)
+    version_part = file_part(app_info["version_name"])
+    artifact = work / f"{PACKAGE_NAME}-{app_info['version_code']}-{app_info['architecture']}.{artifact_type}"
+    merged = work / f"{PACKAGE_NAME}-{app_info['version_code']}-{app_info['architecture']}-merged.apk"
+    unclone_apk = dist / f"dcinside-{version_part}-revanced-{last_commit}-unclone.apk"
+    clone_apk = dist / f"dcinside-{version_part}-revanced-{last_commit}-clone.apk"
+    metadata_path = dist / "metadata.json"
 
-        download_apkpure_xapk(clients, app_info["download_url"], xapk)
-    finally:
-        close_apkpure_clients(clients)
-    merge_xapk(apkeditor_file, xapk, merged)
+    download_apkpure_artifact(app_info, artifact)
+    input_apk = artifact
+    if artifact_type == "xapk":
+        merge_xapk(apkeditor_file, artifact, merged)
+        input_apk = merged
 
     log("Building Unclone APK...")
-    patch_apk(cli_file, patches_file, merged, unclone_apk, keystore)
+    patch_apk(cli_file, patches_file, input_apk, unclone_apk, keystore)
     log(f"Unclone APK generated: {unclone_apk}")
 
     log("Building Clone APK...")
     patch_apk(
         cli_file,
         patches_file,
-        merged,
+        input_apk,
         clone_apk,
         keystore,
         [
@@ -994,7 +749,7 @@ def build(args: argparse.Namespace) -> None:
         cli_asset=cli_asset,
         apkeditor_asset=apkeditor_asset,
         app_info=app_info,
-        input_kind="xapk",
+        input_kind=artifact_type,
         keystore_source=keystore_source,
     )
     outputs.update(

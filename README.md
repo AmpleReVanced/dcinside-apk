@@ -10,11 +10,10 @@ It use Release Attestations to provide trusted APKs.
 - `dcinside-{version}-revanced-{patches_commit}-unclone.apk`
 - `dcinside-{version}-revanced-{patches_commit}-clone.apk`
 
-The stock app is always resolved from APKPure's latest DCInside download page through `cloudscraper`. The build extracts the latest `versionCode`, downloads the `arm64-v8a` XAPK from `d.apkpure.com`, merges it with APKEditor, then patches the merged APK.
+The stock app is resolved from APKPure's `app_version` API for `com.dcinside.app.android` with `arm64-v8a` filtering. The build extracts the latest signed APK/XAPK URL and version metadata from the binary API response. XAPK inputs are merged with APKEditor before patching.
 
 ## Credits
 - [morphe](https://github.com/MorpheApp) - patcher
 - [revanced](https://github.com/ReVanced) - previous patcher
-- [cloudscraper](https://github.com/venomous/cloudscraper) - APKPure Cloudflare challenge handling
 - [@REAndroid's APKEditor](https://github.com/REAndroid/APKEditor) - Used in merging split apks
 - [piko](https://github.com/crimera/twitter-apk) - Some components of this project were taken from piko's twitter-apk repository.
