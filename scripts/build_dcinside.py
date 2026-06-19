@@ -288,7 +288,7 @@ def download_github_asset(release: dict[str, Any], patterns: list[str], output: 
 
 
 DOWNLOAD_RE = re.compile(
-    rb"(X?APKJ).."
+    rb"(X?APKJ)[\x00-\xff]{1,5}?"
     rb"(https?://(?:www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}"
     rb"\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_+.~#?&//=]*)"
 )
@@ -337,21 +337,46 @@ def clean_meta_value(value: str) -> str:
     return re.split(r"[\x00-\x1f\x7f]", value, maxsplit=1)[0]
 
 
-def decode_url_meta(url: str) -> dict[str, str]:
+def decode_url_meta_with_trim(url: str) -> tuple[dict[str, str], int]:
     query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
     c_value = query.get("c", [""])[0]
     parts = c_value.split("|")
     if len(parts) < 3:
-        return {}
+        return {}, 0
 
-    payload_b64 = parts[2]
-    payload_b64 += "=" * (-len(payload_b64) % 4)
-    try:
-        payload = base64.urlsafe_b64decode(payload_b64).decode("utf-8", errors="replace")
-    except Exception:
-        return {}
+    fallback: tuple[dict[str, str], int] | None = None
+    payload_b64 = parts[2].rstrip("=")
+    for trim in range(0, min(4, len(payload_b64)) + 1):
+        candidate = payload_b64[:-trim] if trim else payload_b64
+        if not candidate or len(candidate) % 4 == 1:
+            continue
 
-    return {key: clean_meta_value(value) for key, value in urllib.parse.parse_qsl(payload)}
+        padded = candidate + "=" * (-len(candidate) % 4)
+        try:
+            payload = base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        meta = {key: clean_meta_value(value) for key, value in urllib.parse.parse_qsl(payload)}
+        if not meta:
+            continue
+
+        result = (meta, trim)
+        if fallback is None:
+            fallback = result
+        if not re.search(r"[\x00-\x1f\x7f]", payload):
+            return result
+
+    return fallback or ({}, 0)
+
+
+def decode_url_meta(url: str) -> dict[str, str]:
+    meta, _ = decode_url_meta_with_trim(url)
+    return meta
+
+
+def trim_url_suffix(url: str, trim: int) -> str:
+    return url[:-trim] if trim else url
 
 
 def extract_apkpure_api_info(data: bytes) -> dict[str, str]:
@@ -360,15 +385,20 @@ def extract_apkpure_api_info(data: bytes) -> dict[str, str]:
         marker = match.group(1).decode("ascii")
         url = match.group(2).decode("ascii", errors="replace")
         artifact_type = "xapk" if marker == "XAPKJ" else "apk"
-        meta = decode_url_meta(url)
+        meta, url_trim = decode_url_meta_with_trim(url)
         version_name = meta.get("vn") or ""
         version_code = meta.get("vc") or ""
         meta_type = meta.get("t") or artifact_type
 
         if not version_name or not version_code:
             continue
+        try:
+            int(version_code)
+        except ValueError:
+            continue
         if meta_type and meta_type != artifact_type:
             continue
+        url = trim_url_suffix(url, url_trim)
 
         candidates.append(
             {
@@ -387,12 +417,11 @@ def extract_apkpure_api_info(data: bytes) -> dict[str, str]:
     if not candidates:
         raise BuildError("Could not extract an APKPure APK/XAPK download URL from app_version API")
 
-    latest = candidates[0]
+    latest_version_code = max(int(candidate["version_code"]) for candidate in candidates)
     latest_candidates = [
         candidate
         for candidate in candidates
-        if candidate["version_name"] == latest["version_name"]
-        and candidate["version_code"] == latest["version_code"]
+        if int(candidate["version_code"]) == latest_version_code
     ]
     artifact_type = "xapk" if any(candidate["artifact_type"] == "xapk" for candidate in latest_candidates) else "apk"
     latest_candidates = [candidate for candidate in latest_candidates if candidate["artifact_type"] == artifact_type]
