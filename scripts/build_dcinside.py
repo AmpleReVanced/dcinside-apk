@@ -545,7 +545,6 @@ def patch_apk(
         "patch",
         "--patches",
         str(patches),
-        "--purge",
         "-o",
         str(output_apk),
     ]
