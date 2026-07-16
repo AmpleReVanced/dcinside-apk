@@ -21,7 +21,7 @@ from typing import Any
 
 
 PATCHES_REPO = "AmpleReVanced/revanced-patches"
-CLI_REPO = "MorpheApp/morphe-cli"
+CLI_REPO = "MorpheApp/morphe-desktop"
 APKEDITOR_REPO = "REAndroid/APKEditor"
 PACKAGE_NAME = "com.dcinside.app.android"
 APKPURE_PAGE = (
@@ -716,10 +716,10 @@ def build(args: argparse.Namespace) -> None:
     )
 
     patches_file = bins / "patches.mpp"
-    cli_file = bins / "morphe-cli.jar"
+    cli_file = bins / "morphe-desktop.jar"
     apkeditor_file = bins / "apkeditor.jar"
     patches_asset = download_github_asset(patches_release, [r"^patches.*\.mpp$"], patches_file)
-    cli_asset = download_github_asset(cli_release, [r"^morphe-cli.*-all\.jar$"], cli_file)
+    cli_asset = download_github_asset(cli_release, [r"^morphe-desktop.*-all\.jar$"], cli_file)
     apkeditor_release = latest_release(APKEDITOR_REPO, include_prereleases=False) if artifact_type == "xapk" else None
     apkeditor_asset = (
         download_github_asset(apkeditor_release, [r"^APKEditor.*\.jar$"], apkeditor_file)
